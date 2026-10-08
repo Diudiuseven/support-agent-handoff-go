@@ -197,3 +197,97 @@ func (m *MemStore) ListQueue(ctx context.Context) ([]*model.QueueEntry, error) {
 	}
 	return out, nil
 }
+
+// cloneState 深拷贝全部状态（用于事务回滚/隔离）
+func cloneState(sessions map[model.SessionID]*model.Session,
+	agents map[model.AgentID]*model.Agent,
+	messages map[model.SessionID][]*model.Message,
+	handoffs map[string]*model.Handoff,
+	audits map[model.SessionID][]*model.AuditEvent,
+	queue map[model.SessionID]*model.QueueEntry,
+) (map[model.SessionID]*model.Session,
+	map[model.AgentID]*model.Agent,
+	map[model.SessionID][]*model.Message,
+	map[string]*model.Handoff,
+	map[model.SessionID][]*model.AuditEvent,
+	map[model.SessionID]*model.QueueEntry,
+) {
+	cs := make(map[model.SessionID]*model.Session, len(sessions))
+	for k, v := range sessions {
+		cs[k] = cloneSession(v)
+	}
+	ca := make(map[model.AgentID]*model.Agent, len(agents))
+	for k, v := range agents {
+		ca[k] = cloneAgent(v)
+	}
+	cm := make(map[model.SessionID][]*model.Message, len(messages))
+	for k, v := range messages {
+		cp := make([]*model.Message, len(v))
+		for i, mm := range v {
+			c := *mm
+			cp[i] = &c
+		}
+		cm[k] = cp
+	}
+	ch := make(map[string]*model.Handoff, len(handoffs))
+	for k, v := range handoffs {
+		c := *v
+		ch[k] = &c
+	}
+	cau := make(map[model.SessionID][]*model.AuditEvent, len(audits))
+	for k, v := range audits {
+		cp := make([]*model.AuditEvent, len(v))
+		for i, e := range v {
+			c := *e
+			cp[i] = &c
+		}
+		cau[k] = cp
+	}
+	cq := make(map[model.SessionID]*model.QueueEntry, len(queue))
+	for k, v := range queue {
+		c := *v
+		cq[k] = &c
+	}
+	return cs, ca, cm, ch, cau, cq
+}
+
+func (m *MemStore) snapshotState() (map[model.SessionID]*model.Session,
+	map[model.AgentID]*model.Agent,
+	map[model.SessionID][]*model.Message,
+	map[string]*model.Handoff,
+	map[model.SessionID][]*model.AuditEvent,
+	map[model.SessionID]*model.QueueEntry,
+) {
+	return cloneState(m.sessions, m.agents, m.messages, m.handoffs, m.audits, m.queue)
+}
+
+// Update 在一个事务内批量修改状态：
+//   - fn 在一份隔离的状态副本（事务 Store）上执行，期间的多次写操作互不交错；
+//   - fn 返回 nil 时事务结果整体替换当前状态；返回错误时整体回滚，状态不变。
+//
+// 因此会话、交接单、审计、坐席计数等多条记录的联动变更要么整体生效，
+// 要么整体不生效，不会出现半完成的中间态。
+func (m *MemStore) Update(ctx context.Context, fn func(tx Store) error) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	sessions, agents, messages, handoffs, audits, queue := m.snapshotState()
+	tx := &MemStore{
+		sessions: sessions,
+		agents:   agents,
+		messages: messages,
+		handoffs: handoffs,
+		audits:   audits,
+		queue:    queue,
+	}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	m.sessions = tx.sessions
+	m.agents = tx.agents
+	m.messages = tx.messages
+	m.handoffs = tx.handoffs
+	m.audits = tx.audits
+	m.queue = tx.queue
+	return nil
+}

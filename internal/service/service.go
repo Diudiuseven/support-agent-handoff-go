@@ -31,8 +31,10 @@ type Service struct {
 	wake     chan struct{}
 	stopOnce sync.Once
 
-	mbMu      sync.Mutex
-	mailboxes map[model.AgentID]chan *model.Event
+	mbMu             sync.Mutex
+	mailboxes        map[model.AgentID]*chanStats
+	deliveryFailures int64
+	redelivered      int64
 
 	now func() time.Time
 }
@@ -50,15 +52,46 @@ func New(cfg config.Config, st store.Store) *Service {
 	if cfg.OfferRetries <= 0 {
 		cfg.OfferRetries = 2
 	}
+	if cfg.TransferTimeout <= 0 {
+		cfg.TransferTimeout = 60 * time.Second
+	}
+	if cfg.RedeliverInterval <= 0 {
+		cfg.RedeliverInterval = 500 * time.Millisecond
+	}
 	return &Service{
 		cfg:       cfg,
 		st:        st,
 		log:       audit.New(st),
 		stopCh:    make(chan struct{}),
 		wake:      make(chan struct{}, 1),
-		mailboxes: make(map[model.AgentID]chan *model.Event),
+		mailboxes: make(map[model.AgentID]*chanStats),
 		now:       time.Now,
 	}
+}
+
+// chanStats 坐席邮箱与其投递可观测计数
+type chanStats struct {
+	ch       chan *model.Event
+	backlog  int64 // 最近一次扫描时该坐席名下未送达消息数
+	failures int64 // 因邮箱满/离线导致的投递失败累计次数
+}
+
+// Stats 服务运行态可观测指标
+type Stats struct {
+	Backlog          int64 // 当前所有坐席名下未送达消息总数
+	DeliveryFailures int64 // 非阻塞投递因邮箱满/坐席离线而暂缓的累计次数
+	Redelivered      int64 // 周期性补投成功累计消息数
+}
+
+// Stats 返回投递相关可观测计数（快照）
+func (s *Service) Stats() Stats {
+	s.mbMu.Lock()
+	defer s.mbMu.Unlock()
+	st := Stats{DeliveryFailures: s.deliveryFailures, Redelivered: s.redelivered}
+	for _, cs := range s.mailboxes {
+		st.Backlog += cs.backlog
+	}
+	return st
 }
 
 // Run 启动后台分发循环并执行重启恢复
@@ -69,8 +102,9 @@ func (s *Service) Run(ctx context.Context) error {
 	if err := s.Recover(ctx); err != nil {
 		return fmt.Errorf("recover: %w", err)
 	}
-	s.wg.Add(1)
+	s.wg.Add(2)
 	go s.dispatchLoop(ctx)
+	go s.redeliverLoop(ctx)
 	return nil
 }
 
@@ -110,6 +144,38 @@ func (s *Service) safeDispatch(ctx context.Context) {
 	}
 }
 
+// redeliverLoop 周期性补投积压消息。只要坐席在线且邮箱有余量，
+// 最终所有属于它的消息都能按序送达；慢坐席邮箱满时仅跳过，不阻塞任何人。
+func (s *Service) redeliverLoop(ctx context.Context) {
+	defer s.wg.Done()
+	ticker := time.NewTicker(s.cfg.RedeliverInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.safeRedeliver(ctx)
+		}
+	}
+}
+
+func (s *Service) safeRedeliver(ctx context.Context) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n, err := s.redeliverLocked(ctx)
+	if err != nil {
+		_ = s.log.Record(ctx, audit.Event("", "system", model.RoleSystem, "redeliver.error", false, err.Error()))
+	}
+	if n > 0 {
+		s.mbMu.Lock()
+		s.redelivered += int64(n)
+		s.mbMu.Unlock()
+	}
+}
+
 // kickDispatch 唤醒分发循环（非阻塞）
 func (s *Service) kickDispatch() {
 	select {
@@ -124,51 +190,37 @@ func (s *Service) auditLocked(ctx context.Context, sessionID model.SessionID, ac
 	_ = s.log.Record(ctx, audit.Event(sessionID, actorID, role, action, allowed, detail))
 }
 
-func (s *Service) mailboxFor(agentID model.AgentID) chan *model.Event {
+func (s *Service) mailboxStatsFor(agentID model.AgentID) *chanStats {
 	s.mbMu.Lock()
 	defer s.mbMu.Unlock()
-	ch, ok := s.mailboxes[agentID]
+	cs, ok := s.mailboxes[agentID]
 	if !ok {
-		ch = make(chan *model.Event, s.cfg.MailboxSize)
-		s.mailboxes[agentID] = ch
+		cs = &chanStats{ch: make(chan *model.Event, s.cfg.MailboxSize)}
+		s.mailboxes[agentID] = cs
 	}
-	return ch
+	return cs
+}
+
+func (s *Service) mailboxFor(agentID model.AgentID) chan *model.Event {
+	return s.mailboxStatsFor(agentID).ch
+}
+
+// recordDeliveryFailure 记录一次"本可投递但暂缓"（邮箱满/坐席离线）
+func (s *Service) recordDeliveryFailure() {
+	s.mbMu.Lock()
+	s.deliveryFailures++
+	s.mbMu.Unlock()
 }
 
 // notifyAgent 非阻塞投递；邮箱满时不等待（慢坐席不阻塞分发），
-// 事件仍可通过 ListOffers/ListMessages 拉取，不丢。
+// 事件仍持久化在消息层（Delivered=false），由周期性补投循环兜底送达，不丢。
 func (s *Service) notifyAgent(agentID model.AgentID, ev *model.Event) {
-	ch := s.mailboxFor(agentID)
+	cs := s.mailboxStatsFor(agentID)
 	select {
-	case ch <- ev:
+	case cs.ch <- ev:
 	default:
+		s.recordDeliveryFailure()
 	}
-}
-
-// eligibleAgents 返回当前可承接该会话的在线坐席：
-// 在线、有余量、技能匹配（主管可跨技能组）
-func (s *Service) eligibleAgents(ctx context.Context, skill string) ([]*model.Agent, error) {
-	agents, err := s.st.ListAgents(ctx)
-	if err != nil {
-		return nil, err
-	}
-	var out []*model.Agent
-	for _, a := range agents {
-		if !a.Online || a.Active >= a.Capacity {
-			continue
-		}
-		if a.Role == model.RoleSupervisor {
-			out = append(out, a)
-			continue
-		}
-		for _, sk := range a.Skills {
-			if sk == skill {
-				out = append(out, a)
-				break
-			}
-		}
-	}
-	return out, nil
 }
 
 // sortedQueue 按优先级降序、排队时间升序（FIFO）返回排队条目

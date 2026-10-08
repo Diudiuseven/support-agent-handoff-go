@@ -182,6 +182,15 @@ func (f *FileStore) AppendMessage(ctx context.Context, m *model.Message) error {
 	return f.persistLocked()
 }
 
+func (f *FileStore) UpdateMessage(ctx context.Context, m *model.Message) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.MemStore.UpdateMessage(ctx, m); err != nil {
+		return err
+	}
+	return f.persistLocked()
+}
+
 func (f *FileStore) PutHandoff(ctx context.Context, h *model.Handoff) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -215,5 +224,41 @@ func (f *FileStore) DeleteQueueEntry(ctx context.Context, sessionID model.Sessio
 	if err := f.MemStore.DeleteQueueEntry(ctx, sessionID); err != nil {
 		return err
 	}
+	return f.persistLocked()
+}
+
+// Update 事务性批量更新：fn 在隔离副本上执行，成功后整体替换内存状态并
+// 以单次原子快照落盘；失败则什么都不写（磁盘上仍是事务前的完整快照）。
+func (f *FileStore) Update(ctx context.Context, fn func(tx Store) error) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.MemStore.mu.RLock()
+	sessions, agents, messages, handoffs, audits, queue := f.MemStore.snapshotState()
+	f.MemStore.mu.RUnlock()
+
+	tx := &MemStore{
+		sessions: sessions,
+		agents:   agents,
+		messages: messages,
+		handoffs: handoffs,
+		audits:   audits,
+		queue:    queue,
+	}
+	if err := fn(tx); err != nil {
+		return err
+	}
+
+	f.MemStore.mu.Lock()
+	f.MemStore.sessions = tx.sessions
+	f.MemStore.agents = tx.agents
+	f.MemStore.messages = tx.messages
+	f.MemStore.handoffs = tx.handoffs
+	f.MemStore.audits = tx.audits
+	f.MemStore.queue = tx.queue
+	f.MemStore.mu.Unlock()
+
+	// 单次原子快照：多条记录的联动变更只对应一次 rename，
+	// 进程在落盘任意时刻被终止，磁盘上要么是旧快照要么是新快照。
 	return f.persistLocked()
 }

@@ -32,17 +32,19 @@ const (
 type Reason string
 
 const (
-	ReasonHandoffRequested Reason = "handoff_requested"
-	ReasonQueueTimeout     Reason = "queue_timeout"
-	ReasonOfferTimeout     Reason = "offer_timeout"
-	ReasonAgentOffline     Reason = "agent_offline"
-	ReasonAgentUnavailable Reason = "agent_unavailable"
-	ReasonTransferred      Reason = "transferred"
-	ReasonTransferRejected Reason = "transfer_rejected"
-	ReasonSessionEnded     Reason = "session_ended"
-	ReasonRecovered        Reason = "recovered"
-	ReasonEscalated        Reason = "escalated"
-	ReasonClaim            Reason = "claim"
+	ReasonHandoffRequested   Reason = "handoff_requested"
+	ReasonQueueTimeout       Reason = "queue_timeout"
+	ReasonOfferTimeout       Reason = "offer_timeout"
+	ReasonAgentOffline       Reason = "agent_offline"
+	ReasonAgentUnavailable   Reason = "agent_unavailable"
+	ReasonTransferred        Reason = "transferred"
+	ReasonTransferRejected   Reason = "transfer_rejected"
+	ReasonTransferTargetGone Reason = "transfer_target_gone"
+	ReasonTransferTimeout    Reason = "transfer_timeout"
+	ReasonSessionEnded       Reason = "session_ended"
+	ReasonRecovered          Reason = "recovered"
+	ReasonEscalated          Reason = "escalated"
+	ReasonClaim              Reason = "claim"
 )
 
 // Role 操作者角色（用于权限校验）
@@ -74,13 +76,16 @@ type Session struct {
 
 // Agent 坐席
 type Agent struct {
-	ID        AgentID   `json:"id"`
-	Name      string    `json:"name"`
-	Role      Role      `json:"role"`
-	Skills    []string  `json:"skills"`
-	Capacity  int       `json:"capacity"`
-	Online    bool      `json:"online"`
-	Active    int       `json:"active"`
+	ID       AgentID  `json:"id"`
+	Name     string   `json:"name"`
+	Role     Role     `json:"role"`
+	Skills   []string `json:"skills"`
+	Capacity int      `json:"capacity"`
+	Online   bool     `json:"online"`
+	Active   int      `json:"active"`
+	// Reserved 已预留给该坐席、但尚未完成接受的转接会话数。
+	// 容量仲裁不变量：Active + Reserved <= Capacity 恒成立。
+	Reserved  int       `json:"reserved"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
@@ -117,7 +122,10 @@ type Handoff struct {
 	Reason      Reason        `json:"reason"`
 	Status      HandoffStatus `json:"status"`
 	CreatedAt   time.Time     `json:"created_at"`
-	CompletedAt *time.Time    `json:"completed_at"`
+	CompletedAt *time.Time    `json:"completed_at,omitempty"`
+	// Deadline 仅转接类 pending 交接单使用：超过该时间仍未完成则由后台
+	// 确定性兜底（回退原坐席或重新排队），保证会话不会长期停在转接中间态。
+	Deadline *time.Time `json:"deadline,omitempty"`
 }
 
 // AuditEvent 全流程审计事件（只追加）

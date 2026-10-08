@@ -42,4 +42,10 @@ type Store interface {
 	PutQueueEntry(ctx context.Context, q *model.QueueEntry) error
 	DeleteQueueEntry(ctx context.Context, sessionID model.SessionID) error
 	ListQueue(ctx context.Context) ([]*model.QueueEntry, error)
+
+	// Update 在一个事务内执行批量状态变更。fn 在事务视图 tx 上操作：
+	//   - fn 返回 nil：全部变更整体生效（FileStore 下为单次原子快照落盘）；
+	//   - fn 返回错误：全部变更整体回滚，持久化状态保持事务前不变。
+	// 调用方不得在 fn 内再对原 Store 发起写操作（会与事务锁形成嵌套）。
+	Update(ctx context.Context, fn func(tx Store) error) error
 }

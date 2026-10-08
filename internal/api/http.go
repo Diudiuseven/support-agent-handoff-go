@@ -65,7 +65,12 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("POST /agents/{id}/transfer/reject", h.rejectTransfer)
 
 	mux.HandleFunc("GET /queue", h.listQueue)
+	mux.HandleFunc("GET /stats", h.stats)
 	return mux
+}
+
+func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, h.svc.Stats())
 }
 
 func decode(r *http.Request, v interface{}) error {
