@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"sort"
 
 	"github.com/Diudiuseven/support-agent-handoff-go/internal/model"
 )
@@ -15,86 +16,108 @@ func (s *Service) SendMessage(ctx context.Context, sessionID model.SessionID, fr
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	sess, err := s.st.GetSession(ctx, sessionID)
+	var saved *model.Message
+	err := s.inTx(ctx, func() error {
+		sess, err := s.db(ctx).GetSession(ctx, sessionID)
+		if err != nil {
+			return err
+		}
+		if sess.State == model.StateEnded {
+			return ErrInvalidState
+		}
+
+		seq := sess.Seq + 1
+		msg := &model.Message{
+			ID:        fmt.Sprintf("%s-%d", sessionID, seq),
+			SessionID: sessionID,
+			Seq:       seq,
+			From:      from,
+			Body:      body,
+			CreatedAt: s.now(),
+		}
+		switch sess.State {
+		case model.StateAgent, model.StateTransferring:
+			msg.HandlerType = "agent"
+			msg.HandlerID = sess.HandlerID
+		case model.StateBot:
+			msg.HandlerType = "bot"
+		default: // queued / offering：处理方未定，挂起待补投
+			msg.HandlerType = ""
+			msg.HandlerID = ""
+		}
+
+		if err := s.db(ctx).AppendMessage(ctx, msg); err != nil {
+			return err
+		}
+		sess.Seq = seq
+		sess.UpdatedAt = msg.CreatedAt
+		if err := s.db(ctx).PutSession(ctx, sess); err != nil {
+			return err
+		}
+
+		// 机器人处理视为已送达；排队/邀请期间消息挂起（Delivered=false）
+		if msg.HandlerType == "bot" {
+			msg.Delivered = true
+			if err := s.db(ctx).UpdateMessage(ctx, msg); err != nil {
+				return err
+			}
+			saved = msg
+			return nil
+		}
+		if msg.HandlerType == "agent" && msg.HandlerID != "" {
+			// 事务内立即占用邮箱槽位（持 s.mu，顺序与落盘一致）；
+			// 满则 Delivered 保持 false，由周期补投循环送达。
+			agentID := model.AgentID(msg.HandlerID)
+			ev := &model.Event{
+				Type:      model.EventMessage,
+				SessionID: sessionID,
+				Message:   msg,
+				At:        msg.CreatedAt,
+			}
+			msg.Delivered = s.deliverMessageLocked(agentID, ev)
+			if err := s.db(ctx).UpdateMessage(ctx, msg); err != nil {
+				return err
+			}
+		}
+		saved = msg
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	if sess.State == model.StateEnded {
-		return nil, ErrInvalidState
-	}
-
-	seq := sess.Seq + 1
-	msg := &model.Message{
-		ID:        fmt.Sprintf("%s-%d", sessionID, seq),
-		SessionID: sessionID,
-		Seq:       seq,
-		From:      from,
-		Body:      body,
-		CreatedAt: s.now(),
-	}
-	switch sess.State {
-	case model.StateAgent, model.StateTransferring:
-		msg.HandlerType = "agent"
-		msg.HandlerID = sess.HandlerID
-	case model.StateBot:
-		msg.HandlerType = "bot"
-	default: // queued / offering：处理方未定，挂起待补投
-		msg.HandlerType = ""
-		msg.HandlerID = ""
-	}
-
-	if err := s.st.AppendMessage(ctx, msg); err != nil {
-		return nil, err
-	}
-	sess.Seq = seq
-	sess.UpdatedAt = msg.CreatedAt
-	if err := s.st.PutSession(ctx, sess); err != nil {
-		return nil, err
-	}
-
-	// 投递：坐席邮箱非阻塞，满则保留 Delivered=false，由接管/恢复时补投
-	if msg.HandlerType == "agent" && msg.HandlerID != "" {
-		ev := &model.Event{
-			Type:      model.EventMessage,
-			SessionID: sessionID,
-			Message:   msg,
-			At:        msg.CreatedAt,
-		}
-		select {
-		case s.mailboxFor(model.AgentID(msg.HandlerID)) <- ev:
-			msg.Delivered = true
-			_ = s.st.UpdateMessage(ctx, msg)
-		default:
-			msg.Delivered = false
-		}
-	} else {
-		msg.Delivered = true // 机器人处理或挂起（挂起消息在接管时补投）
-		if msg.HandlerType == "" {
-			msg.Delivered = false
-		}
-		_ = s.st.UpdateMessage(ctx, msg)
-	}
-	return msg, nil
+	return saved, nil
 }
 
-// deliverPendingLocked 会话处理方确定后，补投所有未投递消息（调用方持有 s.mu）
+// mailboxHasRoom 非阻塞探测邮箱当前是否可立即写入（不真正写入）。
+func (s *Service) mailboxHasRoom(agentID model.AgentID) bool {
+	ch := s.mailboxFor(agentID)
+	return len(ch) < cap(ch)
+}
+
+// deliverPendingLocked 把会话当前处理方名下所有 Delivered=false 的消息按 Seq
+// 顺序补投到其邮箱（调用方持有 s.mu 且处于事务内）。
+// 邮箱满时立即停止（不跳过、不跳号），由下一周期/下一次状态变更继续，
+// 因此最终送达且严格有序；慢坐席不会阻塞其他会话分发。
 func (s *Service) deliverPendingLocked(ctx context.Context, sess *model.Session) error {
-	if sess.State != model.StateAgent || sess.HandlerID == "" {
+	if (sess.State != model.StateAgent && sess.State != model.StateTransferring) || sess.HandlerID == "" {
 		return nil
 	}
-	msgs, err := s.st.ListMessages(ctx, sess.ID)
+	msgs, err := s.db(ctx).ListMessages(ctx, sess.ID)
 	if err != nil {
 		return err
 	}
-	ch := s.mailboxFor(model.AgentID(sess.HandlerID))
-	undelivered := make([]*model.Message, 0)
+	sort.Slice(msgs, func(i, j int) bool { return msgs[i].Seq < msgs[j].Seq })
+	agentID := model.AgentID(sess.HandlerID)
 	for _, m := range msgs {
 		if m.Delivered {
 			continue
 		}
-		undelivered = append(undelivered, m)
-	}
-	for _, m := range undelivered {
+		// 严格按 Seq：只在邮箱确实有空位时投递；一旦满立即停止该会话，
+		// 不跳过、不跳号，因此最终送达且会话内严格有序。
+		if !s.mailboxHasRoom(agentID) {
+			s.deliveryFailures++
+			return nil
+		}
 		cp := *m
 		cp.HandlerType = "agent"
 		cp.HandlerID = sess.HandlerID
@@ -104,17 +127,13 @@ func (s *Service) deliverPendingLocked(ctx context.Context, sess *model.Session)
 			Message:   &cp,
 			At:        s.now(),
 		}
-		select {
-		case ch <- ev:
-			m.Delivered = true
-			m.HandlerType = "agent"
-			m.HandlerID = sess.HandlerID
-			if err := s.st.UpdateMessage(ctx, m); err != nil {
-				return err
-			}
-		default:
-			// 邮箱满：跳过，等下次投递机会，不阻塞主流程
-			return nil
+		ok := s.deliverMessageLocked(agentID, ev)
+		s.redeliveryAttempts++
+		m.HandlerType = "agent"
+		m.HandlerID = sess.HandlerID
+		m.Delivered = ok
+		if err := s.db(ctx).UpdateMessage(ctx, m); err != nil {
+			return err
 		}
 	}
 	return nil

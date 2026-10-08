@@ -32,17 +32,19 @@ const (
 type Reason string
 
 const (
-	ReasonHandoffRequested Reason = "handoff_requested"
-	ReasonQueueTimeout     Reason = "queue_timeout"
-	ReasonOfferTimeout     Reason = "offer_timeout"
-	ReasonAgentOffline     Reason = "agent_offline"
-	ReasonAgentUnavailable Reason = "agent_unavailable"
-	ReasonTransferred      Reason = "transferred"
-	ReasonTransferRejected Reason = "transfer_rejected"
-	ReasonSessionEnded     Reason = "session_ended"
-	ReasonRecovered        Reason = "recovered"
-	ReasonEscalated        Reason = "escalated"
-	ReasonClaim            Reason = "claim"
+	ReasonHandoffRequested   Reason = "handoff_requested"
+	ReasonQueueTimeout       Reason = "queue_timeout"
+	ReasonOfferTimeout       Reason = "offer_timeout"
+	ReasonAgentOffline       Reason = "agent_offline"
+	ReasonAgentUnavailable   Reason = "agent_unavailable"
+	ReasonTransferred        Reason = "transferred"
+	ReasonTransferRejected   Reason = "transfer_rejected"
+	ReasonTransferTimeout    Reason = "transfer_timeout"
+	ReasonTransferTargetFull Reason = "transfer_target_full"
+	ReasonSessionEnded       Reason = "session_ended"
+	ReasonRecovered          Reason = "recovered"
+	ReasonEscalated          Reason = "escalated"
+	ReasonClaim              Reason = "claim"
 )
 
 // Role 操作者角色（用于权限校验）
@@ -118,6 +120,8 @@ type Handoff struct {
 	Status      HandoffStatus `json:"status"`
 	CreatedAt   time.Time     `json:"created_at"`
 	CompletedAt *time.Time    `json:"completed_at"`
+	// Deadline 仅转接单使用：目标坐席在此之前未接受/拒绝则系统自动裁决
+	Deadline *time.Time `json:"deadline,omitempty"`
 }
 
 // AuditEvent 全流程审计事件（只追加）

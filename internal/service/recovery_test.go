@@ -135,7 +135,7 @@ func TestRecoverQueuedSession(t *testing.T) {
 	}
 }
 
-// 重启恢复：未完成的转接回退排队继续推进
+// 重启恢复：未完成的转接回退原坐席（原坐席仍在线）；原坐席离线则重新排队
 func TestRecoverTransferringSession(t *testing.T) {
 	cfg := testConfig()
 	svc, dir := newFileBackedService(t, cfg)
@@ -170,8 +170,9 @@ func TestRecoverTransferringSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sess.State != model.StateQueued {
-		t.Fatalf("recovered state = %s, want queued", sess.State)
+	// 原坐席 a1 仍在线：转接崩溃后确定性回退原坐席，会话不悬空
+	if sess.State != model.StateAgent || sess.HandlerID != "a1" {
+		t.Fatalf("recovered state = %s/%s, want agent/a1", sess.State, sess.HandlerID)
 	}
 	// 未完成的转接单标记失败
 	hs, _ := svc2.ListHandoffs(ctx, "s1")
@@ -187,14 +188,81 @@ func TestRecoverTransferringSession(t *testing.T) {
 	if transfer.Status != model.HandoffFailed {
 		t.Fatalf("pending transfer status = %s, want failed", transfer.Status)
 	}
-	// 队列可继续推进
+	// 容量仍准确：a1 持有 1 个，a2 为 0
+	if a1, _ := svc2.st.GetAgent(ctx, "a1"); a1.Active != 1 {
+		t.Fatalf("a1 active = %d, want 1", a1.Active)
+	}
+	if a2, _ := svc2.st.GetAgent(ctx, "a2"); a2.Active != 0 {
+		t.Fatalf("a2 active = %d, want 0", a2.Active)
+	}
+	// 队列中不应有该会话（会话回到 a1 名下）
+	if q, _ := svc2.ListQueue(ctx); len(q) != 0 {
+		t.Fatalf("queue = %d, want 0", len(q))
+	}
+}
+
+// 重启恢复：未完成转接且原坐席已离线 → 重新排队继续推进
+func TestRecoverTransferringSessionRequeue(t *testing.T) {
+	cfg := testConfig()
+	svc, dir := newFileBackedService(t, cfg)
+	ctx := context.Background()
+
+	if _, err := svc.StartSession(ctx, "s1", "tech"); err != nil {
+		t.Fatal(err)
+	}
+	registerAgent(t, svc, "a1", []string{"tech"}, 2, true)
+	registerAgent(t, svc, "a2", []string{"tech"}, 2, true)
+	if _, err := svc.RequestHandoff(ctx, "s1", model.ReasonHandoffRequested); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 2*time.Second, func() bool {
+		s, _ := svc.GetSession(ctx, "s1")
+		return s.State == model.StateOffering
+	})
+	if _, err := svc.Claim(ctx, "a1", "s1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Transfer(ctx, "a1", model.RoleAgent, "s1", "a2"); err != nil {
+		t.Fatal(err)
+	}
+	// 原坐席在转接期间下线（与转接交织）：会话回到排队（可能已被快速重新邀请）
+	if err := svc.AgentOffline(ctx, "a1"); err != nil {
+		t.Fatal(err)
+	}
+	if s, _ := svc.GetSession(ctx, "s1"); s.State != model.StateQueued && s.State != model.StateOffering {
+		t.Fatalf("after offline want queued/offering, got %s", s.State)
+	}
+	svc.Stop()
+
+	svc2 := restartService(t, dir, cfg)
+	sess, err := svc2.GetSession(ctx, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sess.State != model.StateQueued {
+		t.Fatalf("recovered state = %s, want queued", sess.State)
+	}
 	q, _ := svc2.ListQueue(ctx)
 	if len(q) != 1 {
 		t.Fatalf("queue = %d, want 1", len(q))
 	}
+	// 新坐席上线后继续分发并接管
+	registerAgent(t, svc2, "a3", []string{"tech"}, 2, true)
+	eventually(t, 2*time.Second, func() bool {
+		s, _ := svc2.GetSession(ctx, "s1")
+		return s.State == model.StateOffering
+	})
+	if _, err := svc2.Claim(ctx, "a3", "s1"); err != nil {
+		t.Fatal(err)
+	}
+	sess, _ = svc2.GetSession(ctx, "s1")
+	if sess.State != model.StateAgent || sess.HandlerID != "a3" {
+		t.Fatalf("after claim: %s/%s", sess.State, sess.HandlerID)
+	}
 }
 
-// 重启恢复：崩溃在"状态已切换但交接单未完成"之间，恢复后补完成交接单
+// 重启恢复：崩溃在"状态已切换但交接单未完成"之间，恢复后补完成交接单。
+// 通过直接注入一个"半完成"磁盘快照来模拟任意时刻被中断（绕过事务）。
 func TestRecoverPendingHandoffCompletion(t *testing.T) {
 	cfg := testConfig()
 	svc, dir := newFileBackedService(t, cfg)
@@ -207,23 +275,38 @@ func TestRecoverPendingHandoffCompletion(t *testing.T) {
 	if _, err := svc.RequestHandoff(ctx, "s1", model.ReasonHandoffRequested); err != nil {
 		t.Fatal(err)
 	}
-	// 模拟崩溃中间态：会话已在 agent 态、交接单仍 pending
-	now := time.Now()
+	eventually(t, 2*time.Second, func() bool {
+		s, _ := svc.GetSession(ctx, "s1")
+		return s.State == model.StateOffering
+	})
+
+	// 构造半完成快照：会话已在 agent/a1，但交接单仍 pending
 	sess, _ := svc.GetSession(ctx, "s1")
 	sess.State = model.StateAgent
 	sess.HandlerType = "agent"
 	sess.HandlerID = "a1"
-	_ = svc.st.PutSession(ctx, sess)
-	_ = svc.st.PutHandoff(ctx, &model.Handoff{
-		ID:        "handoff-pending",
-		SessionID: "s1",
-		FromType:  "queue",
-		ToType:    "agent",
-		ToID:      "a1",
-		Reason:    model.ReasonClaim,
-		Status:    model.HandoffPending,
-		CreatedAt: now,
-	})
+	sess.OfferID = ""
+	a1, _ := svc.st.GetAgent(ctx, "a1")
+	now := time.Now()
+	fs := svc.st.(*store.FileStore)
+	if err := fs.LoadSnapshotForTest(store.SnapshotData{
+		Sessions: map[model.SessionID]*model.Session{"s1": sess},
+		Agents:   map[model.AgentID]*model.Agent{"a1": a1},
+		Handoffs: map[string]*model.Handoff{
+			"handoff-pending": {
+				ID:        "handoff-pending",
+				SessionID: "s1",
+				FromType:  "queue",
+				ToType:    "agent",
+				ToID:      "a1",
+				Reason:    model.ReasonClaim,
+				Status:    model.HandoffPending,
+				CreatedAt: now,
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
 	svc.Stop()
 
 	svc2 := restartService(t, dir, cfg)
@@ -237,8 +320,8 @@ func TestRecoverPendingHandoffCompletion(t *testing.T) {
 	if !found {
 		t.Fatalf("pending handoff not completed after recovery: %+v", hs)
 	}
-	a1, _ := svc2.st.GetAgent(ctx, "a1")
-	if a1.Active != 1 {
-		t.Fatalf("a1 active = %d, want 1", a1.Active)
+	a1r, _ := svc2.st.GetAgent(ctx, "a1")
+	if a1r.Active != 1 {
+		t.Fatalf("a1 active = %d, want 1", a1r.Active)
 	}
 }

@@ -16,11 +16,54 @@ const snapshotFile = "snapshot.json"
 // FileStore 在 MemStore 基础上，每次写操作后把全量状态原子快照到磁盘，
 // 崩溃/重启后可从快照恢复（见 service.Recover）。
 // 写盘采用"临时文件 + fsync + rename + 目录 fsync"，保证快照不损坏。
+// 事务（BeginTx）在工作副本上累积变更，Commit 时整体替换内存并只写一次
+// 原子快照，因此一个业务操作内的多条记录要么全部生效，要么全部不生效。
 type FileStore struct {
 	*MemStore
 	dir string
 	mu  sync.Mutex
 }
+
+// BeginTx 返回一个 FileTx：工作副本为 MemStore 深拷贝，期间不触碰父状态，
+// Commit 时在同一把 f.mu 内替换内存并原子落盘。
+func (f *FileStore) BeginTx(ctx context.Context) (Tx, error) {
+	work, err := f.MemStore.BeginTx(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &fileTx{file: f, memTx: work.(*memTx)}, nil
+}
+
+type fileTx struct {
+	file *FileStore
+	*memTx
+	finished bool
+}
+
+func (t *fileTx) Commit() error {
+	if t.finished {
+		return nil
+	}
+	t.finished = true
+	t.file.mu.Lock()
+	defer t.file.mu.Unlock()
+	if err := t.memTx.Commit(); err != nil {
+		return err
+	}
+	return t.file.persistLocked()
+}
+
+func (t *fileTx) Rollback() {
+	if t.finished {
+		return
+	}
+	t.finished = true
+	t.memTx.Rollback()
+}
+
+// Init/Close 委托给嵌入的工作副本（覆盖从 *FileStore 侧误用的可能）
+func (t *fileTx) Init(ctx context.Context) error { return t.memTx.Init(ctx) }
+func (t *fileTx) Close() error                   { return t.memTx.Close() }
 
 type snapshot struct {
 	Sessions map[model.SessionID]*model.Session      `json:"sessions"`
@@ -148,8 +191,6 @@ func (f *FileStore) persistLocked() error {
 func (f *FileStore) Close() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.MemStore.mu.RLock()
-	defer f.MemStore.mu.RUnlock()
 	return f.persistLocked()
 }
 
@@ -177,6 +218,17 @@ func (f *FileStore) AppendMessage(ctx context.Context, m *model.Message) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := f.MemStore.AppendMessage(ctx, m); err != nil {
+		return err
+	}
+	return f.persistLocked()
+}
+
+// UpdateMessage 覆写：MemStore 内嵌版本不会触发快照，若不覆写会导致
+// 消息 Delivered 标记只存在于内存，重启后积压消息被重复投递。
+func (f *FileStore) UpdateMessage(ctx context.Context, m *model.Message) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.MemStore.UpdateMessage(ctx, m); err != nil {
 		return err
 	}
 	return f.persistLocked()
@@ -216,4 +268,30 @@ func (f *FileStore) DeleteQueueEntry(ctx context.Context, sessionID model.Sessio
 		return err
 	}
 	return f.persistLocked()
+}
+
+// LoadSnapshotForTest 用给定快照一次性替换全部内存状态并原子落盘。
+// 仅用于测试：构造"崩溃后留下的半完成快照"以验证 Recover 的幂等修复。
+func (f *FileStore) LoadSnapshotForTest(snap SnapshotData) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.MemStore.mu.Lock()
+	f.MemStore.sessions = cloneMap(snap.Sessions, cloneSession)
+	f.MemStore.agents = cloneMap(snap.Agents, cloneAgent)
+	f.MemStore.messages = cloneMessages(snap.Messages)
+	f.MemStore.handoffs = cloneMap(snap.Handoffs, func(h *model.Handoff) *model.Handoff { cp := *h; return &cp })
+	f.MemStore.audits = cloneAudits(snap.Audits)
+	f.MemStore.queue = cloneMap(snap.Queue, func(q *model.QueueEntry) *model.QueueEntry { cp := *q; return &cp })
+	f.MemStore.mu.Unlock()
+	return f.persistLocked()
+}
+
+// SnapshotData 快照数据（测试注入用）
+type SnapshotData struct {
+	Sessions map[model.SessionID]*model.Session
+	Agents   map[model.AgentID]*model.Agent
+	Messages map[model.SessionID][]*model.Message
+	Handoffs map[string]*model.Handoff
+	Audits   map[model.SessionID][]*model.AuditEvent
+	Queue    map[model.SessionID]*model.QueueEntry
 }

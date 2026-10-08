@@ -32,6 +32,83 @@ func NewMemStore() *MemStore {
 func (m *MemStore) Init(ctx context.Context) error { return nil }
 func (m *MemStore) Close() error                   { return nil }
 
+// BeginTx 在当前状态的深拷贝上开启事务；Commit 时工作副本整体替换原状态。
+func (m *MemStore) BeginTx(ctx context.Context) (Tx, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	w := NewMemStore()
+	w.sessions = cloneMap(m.sessions, cloneSession)
+	w.agents = cloneMap(m.agents, cloneAgent)
+	w.messages = cloneMessages(m.messages)
+	w.handoffs = cloneMap(m.handoffs, func(h *model.Handoff) *model.Handoff { cp := *h; return &cp })
+	w.audits = cloneAudits(m.audits)
+	w.queue = cloneMap(m.queue, func(q *model.QueueEntry) *model.QueueEntry { cp := *q; return &cp })
+	return &memTx{MemStore: w, parent: m}, nil
+}
+
+// memTx 在独立的 MemStore 工作副本上读写；Commit 时原子替换父 store 的全部 map。
+type memTx struct {
+	*MemStore
+	parent   *MemStore
+	finished bool
+}
+
+func (t *memTx) Commit() error {
+	if t.finished {
+		return nil
+	}
+	t.finished = true
+	t.parent.mu.Lock()
+	defer t.parent.mu.Unlock()
+	t.MemStore.mu.Lock()
+	defer t.MemStore.mu.Unlock()
+	t.parent.sessions = t.MemStore.sessions
+	t.parent.agents = t.MemStore.agents
+	t.parent.messages = t.MemStore.messages
+	t.parent.handoffs = t.MemStore.handoffs
+	t.parent.audits = t.MemStore.audits
+	t.parent.queue = t.MemStore.queue
+	return nil
+}
+
+func (t *memTx) Rollback() {
+	t.finished = true // 丢弃工作副本即可
+}
+
+func cloneMap[K comparable, V any](src map[K]V, cp func(V) V) map[K]V {
+	dst := make(map[K]V, len(src))
+	for k, v := range src {
+		dst[k] = cp(v)
+	}
+	return dst
+}
+
+func cloneMessages(src map[model.SessionID][]*model.Message) map[model.SessionID][]*model.Message {
+	dst := make(map[model.SessionID][]*model.Message, len(src))
+	for k, list := range src {
+		cp := make([]*model.Message, len(list))
+		for i, m := range list {
+			cm := *m
+			cp[i] = &cm
+		}
+		dst[k] = cp
+	}
+	return dst
+}
+
+func cloneAudits(src map[model.SessionID][]*model.AuditEvent) map[model.SessionID][]*model.AuditEvent {
+	dst := make(map[model.SessionID][]*model.AuditEvent, len(src))
+	for k, list := range src {
+		cp := make([]*model.AuditEvent, len(list))
+		for i, e := range list {
+			ce := *e
+			cp[i] = &ce
+		}
+		dst[k] = cp
+	}
+	return dst
+}
+
 func cloneSession(s *model.Session) *model.Session {
 	cp := *s
 	return &cp
